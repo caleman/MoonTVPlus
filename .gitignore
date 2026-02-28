@@ -33,6 +33,11 @@ yarn-error.log*
 # vercel
 .vercel
 
+# cloudflare
+.open-next/
+.wrangler/
+wrangler.toml.bak
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts
@@ -50,3 +55,11 @@ public/sw.js
 public/sw.js.map
 public/workbox-*.js
 public/workbox-*.js.map
+
+/.claude
+/.vscode
+# SQLite 开发数据库
+.data/
+*.db
+*.db-shm
+*.db-wal

@@ -1,6 +1,7 @@
 import { Radio, X } from 'lucide-react';
 import Image from 'next/image';
 import React, { useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 
 interface ActionItem {
   id: string;
@@ -23,6 +24,7 @@ interface MobileActionSheetProps {
   currentEpisode?: number; // 当前集数
   totalEpisodes?: number; // 总集数
   origin?: 'vod' | 'live';
+  onPosterClick?: () => void; // 海报点击回调
 }
 
 const MobileActionSheet: React.FC<MobileActionSheetProps> = ({
@@ -37,9 +39,16 @@ const MobileActionSheet: React.FC<MobileActionSheetProps> = ({
   currentEpisode,
   totalEpisodes,
   origin = 'vod',
+  onPosterClick,
 }) => {
   const [isVisible, setIsVisible] = useState(false);
   const [isAnimating, setIsAnimating] = useState(false);
+  const [mounted, setMounted] = useState(false);
+
+  // 确保组件在客户端挂载后才渲染 Portal
+  useEffect(() => {
+    setMounted(true);
+  }, []);
 
   // 控制动画状态
   useEffect(() => {
@@ -136,7 +145,7 @@ const MobileActionSheet: React.FC<MobileActionSheetProps> = ({
     }
   }, [isVisible, onClose]);
 
-  if (!isVisible) return null;
+  if (!isVisible || !mounted) return null;
 
   const getActionColor = (color: ActionItem['color']) => {
     switch (color) {
@@ -160,7 +169,7 @@ const MobileActionSheet: React.FC<MobileActionSheetProps> = ({
     }
   };
 
-  return (
+  const content = (
     <div
       className="fixed inset-0 z-[9999] flex items-end justify-center"
       onTouchMove={(e) => {
@@ -214,7 +223,13 @@ const MobileActionSheet: React.FC<MobileActionSheetProps> = ({
         <div className="flex items-center justify-between p-4 border-b border-gray-100 dark:border-gray-800">
           <div className="flex items-center gap-3 flex-1 min-w-0">
             {poster && (
-              <div className="relative w-12 h-16 rounded-lg overflow-hidden bg-gray-100 dark:bg-gray-800 flex-shrink-0">
+              <div
+                className="relative w-12 h-16 rounded-lg overflow-hidden bg-gray-100 dark:bg-gray-800 flex-shrink-0 cursor-pointer hover:opacity-90 transition-opacity"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onPosterClick?.();
+                }}
+              >
                 <Image
                   src={poster}
                   alt={title}
@@ -344,6 +359,9 @@ const MobileActionSheet: React.FC<MobileActionSheetProps> = ({
       </div>
     </div>
   );
+
+  // 使用 Portal 将组件渲染到 document.body
+  return createPortal(content, document.body);
 };
 
 export default MobileActionSheet;

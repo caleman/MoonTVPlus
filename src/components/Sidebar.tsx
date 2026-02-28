@@ -2,7 +2,7 @@
 
 'use client';
 
-import { Cat, Clover, Film, Home, Menu, Radio, Search, Star, Tv } from 'lucide-react';
+import { Cat, Clover, Film, FolderOpen, Globe, Home, Menu, Search, Star, Tv, Users } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname, useSearchParams } from 'next/navigation';
 import {
@@ -15,6 +15,7 @@ import {
 } from 'react';
 
 import { useSite } from './SiteProvider';
+import { useWatchRoomContextSafe } from './WatchRoomProvider';
 
 interface SidebarContextType {
   isCollapsed: boolean;
@@ -51,7 +52,9 @@ declare global {
   interface Window {
     __sidebarCollapsed?: boolean;
     RUNTIME_CONFIG?: {
-      EnableComments: boolean;
+      EnableComments?: boolean;
+      RecommendationDataSource?: string;
+      [key: string]: any;
     };
   }
 }
@@ -59,6 +62,7 @@ declare global {
 const Sidebar = ({ onToggle, activePath = '/' }: SidebarProps) => {
   const pathname = usePathname();
   const searchParams = useSearchParams();
+  const watchRoomContext = useWatchRoomContextSafe();
   // 若同一次 SPA 会话中已经读取过折叠状态，则直接复用，避免闪烁
   const [isCollapsed, setIsCollapsed] = useState<boolean>(() => {
     if (
@@ -139,25 +143,87 @@ const Sidebar = ({ onToggle, activePath = '/' }: SidebarProps) => {
       href: '/douban?type=show',
     },
     {
-      icon: Radio,
-      label: '直播',
+      icon: Tv,
+      label: '电视直播',
       href: '/live',
+    },
+    {
+      icon: Globe,
+      label: '网络直播',
+      href: '/web-live',
     },
   ]);
 
   useEffect(() => {
     const runtimeConfig = (window as any).RUNTIME_CONFIG;
-    if (runtimeConfig?.CUSTOM_CATEGORIES?.length > 0) {
-      setMenuItems((prevItems) => [
-        ...prevItems,
-        {
-          icon: Star,
-          label: '自定义',
-          href: '/douban?type=custom',
-        },
-      ]);
+
+    // 基础菜单项（不包括观影室）
+    const items = [
+      {
+        icon: Film,
+        label: '电影',
+        href: '/douban?type=movie',
+      },
+      {
+        icon: Tv,
+        label: '剧集',
+        href: '/douban?type=tv',
+      },
+      {
+        icon: Cat,
+        label: '动漫',
+        href: '/douban?type=anime',
+      },
+      {
+        icon: Clover,
+        label: '综艺',
+        href: '/douban?type=show',
+      },
+      {
+        icon: Tv,
+        label: '电视直播',
+        href: '/live',
+      },
+    ];
+
+    // 如果启用网络直播，添加网络直播入口
+    if (runtimeConfig?.WEB_LIVE_ENABLED) {
+      items.push({
+        icon: Globe,
+        label: '网络直播',
+        href: '/web-live',
+      });
     }
-  }, []);
+
+    // 如果配置了 OpenList 或 Emby，添加私人影库入口
+    if (runtimeConfig?.PRIVATE_LIBRARY_ENABLED) {
+      items.push({
+        icon: FolderOpen,
+        label: '私人影库',
+        href: '/private-library',
+      });
+    }
+
+    // 如果启用观影室，添加观影室入口
+    if (watchRoomContext?.isEnabled) {
+      items.push({
+        icon: Users,
+        label: '观影室',
+        href: '/watch-room',
+      });
+    }
+
+    // 添加自定义分类（如果有）
+    if (runtimeConfig?.CUSTOM_CATEGORIES?.length > 0) {
+      items.push({
+        icon: Star,
+        label: '自定义',
+        href: '/douban?type=custom',
+      });
+    }
+
+    setMenuItems(items);
+  }, [watchRoomContext?.isEnabled]);
 
   return (
     <SidebarContext.Provider value={contextValue}>

@@ -1,8 +1,15 @@
 /* eslint-disable no-console,@typescript-eslint/no-explicit-any */
 import { NextRequest, NextResponse } from 'next/server';
 
+import { parseAuthInfo } from '@/lib/auth';
 import { getConfig } from '@/lib/config';
 import { db } from '@/lib/db';
+import {
+  generateRefreshToken,
+  generateTokenId,
+  storeRefreshToken,
+  TOKEN_CONFIG,
+} from '@/lib/refresh-token';
 
 export const runtime = 'nodejs';
 
@@ -14,6 +21,21 @@ const STORAGE_TYPE =
     | 'upstash'
     | 'kvrocks'
     | undefined) || 'localstorage';
+
+function buildLoginResponse(authToken?: string | null) {
+  const body: Record<string, unknown> = { ok: true };
+
+  if (authToken) {
+    body.token = authToken;
+    const authInfo = parseAuthInfo(authToken);
+    if (authInfo) {
+      const { password, ...rest } = authInfo;
+      body.auth = rest;
+    }
+  }
+
+  return NextResponse.json(body);
+}
 
 // 生成签名
 async function generateSignature(
@@ -42,13 +64,15 @@ async function generateSignature(
     .join('');
 }
 
-// 生成认证Cookie（带签名）
+// 生成认证Cookie（带签名和 Refresh Token）
 async function generateAuthCookie(
   username?: string,
   password?: string,
   role?: 'owner' | 'admin' | 'user',
-  includePassword = false
+  includePassword = false,
+  deviceInfo?: string
 ): Promise<string> {
+  const now = Date.now();
   const authData: any = { role: role || 'user' };
 
   // 只在需要时包含 password
@@ -58,32 +82,119 @@ async function generateAuthCookie(
 
   if (username && process.env.PASSWORD) {
     authData.username = username;
-    // 使用密码作为密钥对用户名进行签名
-    const signature = await generateSignature(username, process.env.PASSWORD);
+    authData.timestamp = now; // Access Token 时间戳
+
+    // 生成 Refresh Token（仅数据库模式）
+    if (!includePassword && STORAGE_TYPE !== 'localstorage') {
+      const tokenId = generateTokenId();
+      const refreshToken = generateRefreshToken();
+      const refreshExpires = now + TOKEN_CONFIG.REFRESH_TOKEN_AGE;
+
+      authData.tokenId = tokenId;
+      authData.refreshToken = refreshToken;
+      authData.refreshExpires = refreshExpires;
+
+      // 存储到 Redis Hash
+      try {
+        await storeRefreshToken(username, tokenId, {
+          token: refreshToken,
+          deviceInfo: deviceInfo || 'Unknown Device',
+          createdAt: now,
+          expiresAt: refreshExpires,
+          lastUsed: now,
+        });
+      } catch (error) {
+        console.error('Failed to store refresh token:', error);
+      }
+    }
+
+    // 签名所有关键字段（username, role, timestamp）防止篡改
+    const dataToSign = JSON.stringify({
+      username: authData.username,
+      role: authData.role,
+      timestamp: authData.timestamp
+    });
+    const signature = await generateSignature(dataToSign, process.env.PASSWORD);
     authData.signature = signature;
-    authData.timestamp = Date.now(); // 添加时间戳防重放攻击
   }
 
   return encodeURIComponent(JSON.stringify(authData));
 }
 
+// 验证Cloudflare Turnstile Token
+async function verifyTurnstileToken(token: string, secretKey: string): Promise<boolean> {
+  try {
+    const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        secret: secretKey,
+        response: token,
+      }),
+    });
+
+    const data = await response.json();
+    return data.success === true;
+  } catch (error) {
+    console.error('Turnstile验证失败:', error);
+    return false;
+  }
+}
+
+// 获取设备信息
+function getDeviceInfo(request: NextRequest): string {
+  const userAgent = request.headers.get('user-agent') || 'Unknown';
+
+  // 检查是否为 MoonTVPlus APP
+  if (userAgent.toLowerCase().includes('moontvplus')) {
+    return 'MoonTVPlus APP';
+  }
+
+  // 检查是否为 OrionTV
+  if (userAgent.toLowerCase().includes('oriontv')) {
+    return 'OrionTV';
+  }
+
+  // 简单解析 User-Agent
+  let browser = 'Unknown Browser';
+  let os = 'Unknown OS';
+
+  if (userAgent.includes('Chrome')) browser = 'Chrome';
+  else if (userAgent.includes('Firefox')) browser = 'Firefox';
+  else if (userAgent.includes('Safari')) browser = 'Safari';
+  else if (userAgent.includes('Edge')) browser = 'Edge';
+
+  if (userAgent.includes('Windows')) os = 'Windows';
+  else if (userAgent.includes('Mac')) os = 'macOS';
+  else if (userAgent.includes('Linux')) os = 'Linux';
+  else if (userAgent.includes('Android')) os = 'Android';
+  else if (userAgent.includes('iOS')) os = 'iOS';
+
+  return `${browser} on ${os}`;
+}
+
 export async function POST(req: NextRequest) {
   try {
+    // 获取站点配置
+    const adminConfig = await getConfig();
+    const siteConfig = adminConfig.SiteConfig;
+
     // 本地 / localStorage 模式——仅校验固定密码
     if (STORAGE_TYPE === 'localstorage') {
       const envPassword = process.env.PASSWORD;
 
       // 未配置 PASSWORD 时直接放行
       if (!envPassword) {
-        const response = NextResponse.json({ ok: true });
+        const response = buildLoginResponse();
 
         // 清除可能存在的认证cookie
         response.cookies.set('auth', '', {
           path: '/',
           expires: new Date(0),
-          sameSite: 'lax', // 改为 lax 以支持 PWA
-          httpOnly: false, // PWA 需要客户端可访问
-          secure: false, // 根据协议自动设置
+          sameSite: 'lax',
+          httpOnly: false,
         });
 
         return response;
@@ -102,29 +213,32 @@ export async function POST(req: NextRequest) {
       }
 
       // 验证成功，设置认证cookie
-      const response = NextResponse.json({ ok: true });
+      const username = process.env.USERNAME || 'default';
+      const deviceInfo = getDeviceInfo(req);
       const cookieValue = await generateAuthCookie(
-        undefined,
+        username,
         password,
-        'user',
-        true
+        'owner',
+        true,
+        deviceInfo
       ); // localstorage 模式包含 password
+      const response = buildLoginResponse(cookieValue);
       const expires = new Date();
-      expires.setDate(expires.getDate() + 7); // 7天过期
+      expires.setDate(expires.getDate() + 60); // 60天过期（Refresh Token 有效期）
 
       response.cookies.set('auth', cookieValue, {
         path: '/',
         expires,
-        sameSite: 'lax', // 改为 lax 以支持 PWA
-        httpOnly: false, // PWA 需要客户端可访问
-        secure: false, // 根据协议自动设置
+        sameSite: 'lax',
+        httpOnly: false, // 允许客户端访问
+        secure: false,
       });
 
       return response;
     }
 
     // 数据库 / redis 模式——校验用户名并尝试连接数据库
-    const { username, password } = await req.json();
+    const { username, password, turnstileToken } = await req.json();
 
     if (!username || typeof username !== 'string') {
       return NextResponse.json({ error: '用户名不能为空' }, { status: 400 });
@@ -133,28 +247,57 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: '密码不能为空' }, { status: 400 });
     }
 
+    // 如果开启了Turnstile验证
+    if (siteConfig.LoginRequireTurnstile) {
+      if (!turnstileToken) {
+        return NextResponse.json(
+          { error: '请完成人机验证' },
+          { status: 400 }
+        );
+      }
+
+      if (!siteConfig.TurnstileSecretKey) {
+        console.error('Turnstile Secret Key未配置');
+        return NextResponse.json(
+          { error: '服务器配置错误' },
+          { status: 500 }
+        );
+      }
+
+      // 验证Turnstile Token
+      const isValid = await verifyTurnstileToken(turnstileToken, siteConfig.TurnstileSecretKey);
+      if (!isValid) {
+        return NextResponse.json(
+          { error: '人机验证失败，请重试' },
+          { status: 400 }
+        );
+      }
+    }
+
     // 可能是站长，直接读环境变量
     if (
       username === process.env.USERNAME &&
       password === process.env.PASSWORD
     ) {
       // 验证成功，设置认证cookie
-      const response = NextResponse.json({ ok: true });
+      const deviceInfo = getDeviceInfo(req);
       const cookieValue = await generateAuthCookie(
         username,
         password,
         'owner',
-        false
+        false,
+        deviceInfo
       ); // 数据库模式不包含 password
+      const response = buildLoginResponse(cookieValue);
       const expires = new Date();
-      expires.setDate(expires.getDate() + 7); // 7天过期
+      expires.setDate(expires.getDate() + 60); // 60天过期（Refresh Token 有效期）
 
       response.cookies.set('auth', cookieValue, {
         path: '/',
         expires,
-        sameSite: 'lax', // 改为 lax 以支持 PWA
-        httpOnly: false, // PWA 需要客户端可访问
-        secure: false, // 根据协议自动设置
+        sameSite: 'lax',
+        httpOnly: false, // 允许客户端访问
+        secure: false,
       });
 
       return response;
@@ -162,46 +305,56 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: '用户名或密码错误' }, { status: 401 });
     }
 
-    const config = await getConfig();
-    const user = config.UserConfig.Users.find((u) => u.username === username);
-    if (user && user.banned) {
+    // 使用新版本的用户验证
+    let pass = false;
+    let userRole: 'owner' | 'admin' | 'user' = 'user';
+    let isBanned = false;
+
+    // 验证用户
+    const userInfoV2 = await db.getUserInfoV2(username);
+
+    if (userInfoV2) {
+      // 使用新版本验证
+      pass = await db.verifyUserV2(username, password);
+      userRole = userInfoV2.role;
+      isBanned = userInfoV2.banned;
+    }
+
+    // 检查用户是否被封禁
+    if (isBanned) {
       return NextResponse.json({ error: '用户被封禁' }, { status: 401 });
     }
 
-    // 校验用户密码
-    try {
-      const pass = await db.verifyUser(username, password);
-      if (!pass) {
-        return NextResponse.json(
-          { error: '用户名或密码错误' },
-          { status: 401 }
-        );
-      }
-
-      // 验证成功，设置认证cookie
-      const response = NextResponse.json({ ok: true });
-      const cookieValue = await generateAuthCookie(
-        username,
-        password,
-        user?.role || 'user',
-        false
-      ); // 数据库模式不包含 password
-      const expires = new Date();
-      expires.setDate(expires.getDate() + 7); // 7天过期
-
-      response.cookies.set('auth', cookieValue, {
-        path: '/',
-        expires,
-        sameSite: 'lax', // 改为 lax 以支持 PWA
-        httpOnly: false, // PWA 需要客户端可访问
-        secure: false, // 根据协议自动设置
-      });
-
-      return response;
-    } catch (err) {
-      console.error('数据库验证失败', err);
-      return NextResponse.json({ error: '数据库错误' }, { status: 500 });
+    if (!pass) {
+      return NextResponse.json(
+        { error: '用户名或密码错误' },
+        { status: 401 }
+      );
     }
+
+    // 验证成功，设置认证cookie
+    const deviceInfo = getDeviceInfo(req);
+    const cookieValue = await generateAuthCookie(
+      username,
+      password,
+      userRole,
+      false,
+      deviceInfo
+    ); // 数据库模式不包含 password
+    const response = buildLoginResponse(cookieValue);
+    const expires = new Date();
+    expires.setDate(expires.getDate() + 60); // 60天过期（Refresh Token 有效期）
+
+  response.cookies.set('auth', cookieValue, {
+    path: '/',
+    expires,
+    sameSite: 'lax',
+    httpOnly: false, // 允许客户端访问
+  });
+
+    console.log(`Cookie已设置`);
+
+    return response;
   } catch (error) {
     console.error('登录接口异常', error);
     return NextResponse.json({ error: '服务器错误' }, { status: 500 });

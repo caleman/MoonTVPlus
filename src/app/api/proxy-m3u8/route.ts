@@ -7,13 +7,25 @@ export const runtime = 'nodejs';
 /**
  * M3U8 代理接口
  * 用于外部播放器访问,会执行去广告逻辑并处理相对链接
- * GET /api/proxy-m3u8?url=<原始m3u8地址>&source=<播放源>
+ * GET /api/proxy-m3u8?url=<原始m3u8地址>&source=<播放源>&token=<鉴权token>
  */
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
     const m3u8Url = searchParams.get('url');
     const source = searchParams.get('source') || '';
+    const token = searchParams.get('token');
+
+    // Token 鉴权：如果环境变量设置了 token，则必须验证
+    const envToken = process.env.NEXT_PUBLIC_PROXY_M3U8_TOKEN;
+    if (envToken && envToken.trim() !== '') {
+      if (!token || token !== envToken) {
+        return NextResponse.json(
+          { error: '无效的访问令牌' },
+          { status: 401 }
+        );
+      }
+    }
 
     if (!m3u8Url) {
       return NextResponse.json(
@@ -23,13 +35,22 @@ export async function GET(request: Request) {
     }
 
     // 获取当前请求的 origin
-    const requestUrl = new URL(request.url);
-    const origin = `${requestUrl.protocol}//${requestUrl.host}`;
+    // 优先级：SITE_BASE 环境变量 > 从请求头构建
+    let origin = process.env.SITE_BASE;
+    if (!origin) {
+      const requestUrl = new URL(request.url);
+      origin = `${requestUrl.protocol}//${requestUrl.host}`;
+    }
 
     // 获取原始 m3u8 内容
+    const m3u8UrlObj = new URL(m3u8Url);
     const response = await fetch(m3u8Url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Referer': `${m3u8UrlObj.protocol}//${m3u8UrlObj.host}/`,
       },
     });
 
@@ -70,7 +91,7 @@ export async function GET(request: Request) {
     }
 
     // 处理 m3u8 中的相对链接
-    m3u8Content = resolveM3u8Links(m3u8Content, m3u8Url, source, origin);
+    m3u8Content = resolveM3u8Links(m3u8Content, m3u8Url, source, origin, token || '');
 
     // 返回处理后的 m3u8 内容
     return new NextResponse(m3u8Content, {
@@ -95,37 +116,51 @@ export async function GET(request: Request) {
 function filterAdsFromM3U8Default(type: string, m3u8Content: string): string {
   if (!m3u8Content) return '';
 
+  // 广告关键字列表
+  const adKeywords = [
+    'sponsor',
+    '/ad/',
+    '/ads/',
+    'advert',
+    'advertisement',
+    '/adjump',
+    'redtraffic'
+  ];
+
   // 按行分割M3U8内容
   const lines = m3u8Content.split('\n');
   const filteredLines = [];
 
-  let nextdelete = false;
-  for (let i = 0; i < lines.length; i++) {
+  let i = 0;
+  while (i < lines.length) {
     const line = lines[i];
 
-    if (nextdelete) {
-      nextdelete = false;
+    // 跳过 #EXT-X-DISCONTINUITY 标识
+    if (line.includes('#EXT-X-DISCONTINUITY')) {
+      i++;
       continue;
     }
 
-    // 只过滤#EXT-X-DISCONTINUITY标识
-    if (!line.includes('#EXT-X-DISCONTINUITY')) {
-      if (
-        type === 'ruyi' &&
-        (line.includes('EXTINF:5.640000') ||
-          line.includes('EXTINF:2.960000') ||
-          line.includes('EXTINF:3.480000') ||
-          line.includes('EXTINF:4.000000') ||
-          line.includes('EXTINF:0.960000') ||
-          line.includes('EXTINF:10.000000') ||
-          line.includes('EXTINF:1.266667'))
-      ) {
-        nextdelete = true;
-        continue;
-      }
+    // 如果是 EXTINF 行，检查下一行 URL 是否包含广告关键字
+    if (line.includes('#EXTINF:')) {
+      // 检查下一行 URL 是否包含广告关键字
+      if (i + 1 < lines.length) {
+        const nextLine = lines[i + 1];
+        const containsAdKeyword = adKeywords.some(keyword =>
+          nextLine.toLowerCase().includes(keyword.toLowerCase())
+        );
 
-      filteredLines.push(line);
+        if (containsAdKeyword) {
+          // 跳过 EXTINF 行和 URL 行
+          i += 2;
+          continue;
+        }
+      }
     }
+
+    // 保留当前行
+    filteredLines.push(line);
+    i++;
   }
 
   return filteredLines.join('\n');
@@ -134,7 +169,7 @@ function filterAdsFromM3U8Default(type: string, m3u8Content: string): string {
 /**
  * 将 m3u8 中的相对链接转换为绝对链接，并将子 m3u8 链接转为代理链接
  */
-function resolveM3u8Links(m3u8Content: string, baseUrl: string, source: string, proxyOrigin: string): string {
+function resolveM3u8Links(m3u8Content: string, baseUrl: string, source: string, proxyOrigin: string, token: string): string {
   const lines = m3u8Content.split('\n');
   const resolvedLines = [];
 
@@ -203,7 +238,8 @@ function resolveM3u8Links(m3u8Content: string, baseUrl: string, source: string, 
     // 2. 检查是否是子 m3u8，如果是，转换为代理链接
     const isM3u8 = url.includes('.m3u8') || isNextLineUrl;
     if (isM3u8) {
-      url = `${proxyOrigin}/api/proxy-m3u8?url=${encodeURIComponent(url)}${source ? `&source=${encodeURIComponent(source)}` : ''}`;
+      const tokenParam = token ? `&token=${encodeURIComponent(token)}` : '';
+      url = `${proxyOrigin}/api/proxy-m3u8?url=${encodeURIComponent(url)}${source ? `&source=${encodeURIComponent(source)}` : ''}${tokenParam}`;
     }
 
     resolvedLines.push(url);
